@@ -1,0 +1,362 @@
+// ########################################### Utility ################################################## //
+def slaves = 7
+
+def info() {
+    ancestorCommit = sh(
+        script: "git merge-base HEAD remotes/origin/${env.BRANCH_NAME}",
+        returnStdout: true).trim()
+    lastCommit = sh(script: 'git log -1 --pretty=%H', returnStdout: true).trim()
+    echo "==> Common ancestor is ${ancestorCommit}, last commit is ${lastCommit}."
+
+    header = "Job <${env.JOB_DISPLAY_URL}|${env.BRANCH_NAME}>"
+    header += "\nbuild <${env.RUN_DISPLAY_URL}|${env.BUILD_DISPLAY_NAME}>:"
+    body = ""
+    if (lastCommit.equals(ancestorCommit)) {
+        // Get last commit if we do not have a distinct ancestor.
+        commitHashes = [sh(script: "git log -1 --pretty=%H", returnStdout: true).trim()]
+    } else {
+        // Get max 5 commits since ancestor.
+        commitHashes = sh(script: "git rev-list -5 ${ancestorCommit}..", returnStdout: true).trim().tokenize('\n')
+    }
+    for (commit in commitHashes) {
+        author = sh(script: "git log -1 --pretty=%an ${commit}", returnStdout: true).trim()
+        email = sh(script: "git log -1 --pretty=%an ${commit}", returnStdout: true).trim()
+        commitMsg = sh(script: "git log -1 --pretty=%B ${commit}", returnStdout: true).trim()
+        body += "\n``` Commit by <@${author}> : ${commitMsg} ``` "
+    }
+}
+
+def matcher(text, regex) {
+    def matcher = text =~ regex
+    matcher ? matcher[0][1] : null
+}
+@NonCPS
+def mapToJSON(map) {
+    def jsonBuilder = new groovy.json.JsonBuilder(map)
+    jsonBuilder.toPrettyString()
+}
+
+def sendMessage = {color, specificMessage->
+    // Print a message to the console and to Slack.
+    message = "${header}\n${specificMessage}\n${body}"
+    echo "Message ${message}"
+    slackSend channel: 'jenkins-test', teamDomain: 'hungerstationteam', color: color, message: message, failOnError: false
+}
+
+// ########################################### Logic ################################################## //
+
+def login() {
+    sh "docker login --username instabug --password st@yfo0lish"
+}
+
+def knapsack(ci_node_total, cl) {
+    def nodes = [:]
+    for(int i = 0; i < ci_node_total; i++) {
+        def index = i;
+        nodes["Slave ${i}"] = {
+            withEnv(["CI_NODE_INDEX=$index", "TEST_ENV_NUMBER=$index", "CI_NODE_TOTAL=$ci_node_total"]) {
+                cl()
+            }
+        }
+    }
+    return nodes;
+}
+
+def runContainers() {
+    sh "docker network create -d bridge isolated_nw | cat"
+    sh "docker run -d --network isolated_nw --name=redis redis"
+    sh "docker run -d --network isolated_nw --name=database -e 'MYSQL_ROOT_PASSWORD=root' 'mysql:5.6'"
+    // sh "docker run -d --network isolated_nw --name=elasticsearch instabug/test-elasticsearch:latest" //
+    // sh "docker run -d --network isolated_nw --name=elasticsearch-sessions instabug/test-elasticsearch:latest --http.port=9201" //
+    // sh "docker run -d --network isolated_nw --name=elasticsearch-oom-sessions instabug/test-elasticsearch:latest --http.port=9202" //
+}
+
+def buildImages() {
+    login();
+    sh "docker build -f .docker/Dockerfile.test -t instabug/backend-test:latest ."
+    sh "docker push instabug/backend-test:latest"
+}
+
+def pullImages() {
+    login();
+    sh "docker pull instabug/backend-test:latest"
+    sh "docker pull instabug/test-elasticsearch:latest"
+}
+
+def execInContainer(command) {
+    imageName = 'instabug/backend-test:latest'
+    sh "docker run --rm --network isolated_nw --env-file ./env.list -e 'RACK_ENV=test' -e 'RAILS_ENV=test' -e 'BUNDLE_PATH=/bundle' -e 'BUNDLE_GEMFILE=./Gemfile' -v /bundle:/bundle ${imageName} bash -c '${command}'"
+}
+
+def runTests() {
+    branch = 'dev'
+    if(env.BRANCH_NAME == 'master') branch = 'master'
+    execInContainer("tar xzf ${branch}_bundle.tar.gz -C /")
+    execInContainer('gem install bundler')
+    execInContainer('bundle check || bundle install')
+    execInContainer('bundle exec rubocop')
+    execInContainer('bundle exec rake db:drop db:create db:schema:load')
+    execInContainer('bundle exec rake "knapsack:rspec[-f d -c]"')
+    // sh "KNAPSACK_GENERATE_REPORT=true bundle exec rspec -f d --color spec'
+}
+
+def downloadBundle() {
+    branch = 'dev'
+    if(env.BRANCH_NAME == 'master') branch = 'master'
+    withAWS(credentials:'AWS-CREDS') {
+        s3Download(file:"${branch}_bundle.tar.gz", bucket:'instabug-jenkins', path:"${branch}_bundle.tar.gz", force:true)
+    }
+}
+
+def uploadBundle(branch) {
+    sh "tar -zcf ${branch}_bundle.tar.gz /bundle"
+    withAWS(credentials:'AWS-CREDS') {
+        s3Upload(file:"${branch}_bundle.tar.gz", bucket:'instabug-jenkins', path:"${branch}_bundle.tar.gz")
+    }
+}
+
+def prep() {
+    sh "sudo mkdir -p /bundle"
+    sh "sudo chown -R ubuntu:ubuntu /bundle"
+}
+
+def cleanUpNode() {
+    deleteDir()
+    // piping to 'cat' recovers command failure when there are is to kill
+    sh "docker rm -f \$(docker ps -a -q) | cat"
+    sh "docker network rm isolated_nw | cat"
+    sh "docker rmi -f \$(docker images instabug/backend-test -q) | cat"
+    sh "rm -rf *bundle.tar.gz*"
+}
+
+def cleanBeforeTest() {
+    sh "docker rm -f \$(docker ps -a -q) | cat"
+    sh "docker network rm isolated_nw | cat"
+}
+
+def generateMarathonJSON(type, appName, serviceName) {
+    name = 'backend'
+    if(type == 'bp') name = 'background'
+    sh "./go-deploy-ibg --templates-only --branch-name=${BRANCH_NAME} \
+            --repo-name=${REPO_NAME} -K AKIAJHLNTSDE73EUH3IA -S e8SYZxEUtMVBVQOZqBfilsJWEckUKxYkEZRuZsAI \
+            -V ${VERSION} -c ./bin/deployment-templates/${BRANCH_NAME}/${appName}-marathon.json.tmpl \
+            -i instabug/${name}-${BRANCH_NAME} --service-name=${serviceName}"
+}
+
+// ########################################### Pipeline ################################################## //
+
+def test(slaves) {
+    parallel (
+        knapsack(slaves) {
+            node('jenkins-slaves') {
+                cleanBeforeTest()
+                prep()
+                pullImages()
+                runContainers()
+                sh "printenv > env.list"
+                sh "printenv"
+                runTests()
+                if(env.BRANCH_NAME == 'dev' || env.BRANCH_NAME == 'master') {
+                    uploadBundle(env.BRANCH_NAME)
+                }
+                // publishHTML target: [reportDir: 'coverage', reportFiles: 'index.html', reportName: 'Coverage']
+                archive 'coverage'
+            }
+        }
+    )
+}
+
+def deploy(prefix, appName, suffix) {
+    BRANCH_NAME = env.BRANCH_NAME.replaceAll('/', '-')
+    if(BRANCH_NAME == 'master' || BRANCH_NAME == 'dev') {
+        REPO_NAME = matcher(sh (script: "git remote show -n origin | grep Fetch", returnStdout: true), '/([^/]*).git$')
+        VERSION = matcher(sh (script: "cat VERSION.json", returnStdout: true), '"version":\\s*"(.+)"')
+
+        withAWS(credentials:'AWS-CREDS') {
+            s3Download(file:"go-deploy-ibg", bucket:'instabug-jenkins', path:"go-deploy-ibg", force:true)
+        }
+        sh "chmod +x ./go-deploy-ibg"
+
+        def serviceName = appName
+        if(prefix != "") serviceName = prefix + "-" + serviceName
+        if(suffix != "") serviceName += "-" + suffix
+
+        serviceName = serviceName.replaceAll('/', '-')
+        serviceName = serviceName.replaceAll('_', '-')
+        serviceName = serviceName.replaceAll('\n', '')
+
+        // generating the marathon josn config file
+        generateMarathonJSON(prefix, appName, serviceName)
+
+        // marathon json config file
+        CONFIG = sh (
+            script: "cat \"./bin/deployment-templates/${BRANCH_NAME}/${appName}-marathon.json\"",
+            returnStdout: true
+        )
+
+        def map = [:]
+        map["config"] = CONFIG
+        map["repo_name"] = REPO_NAME
+        map["branch_name"] = BRANCH_NAME
+        map["app_name"] = serviceName
+        map["version"] = VERSION
+
+        echo map.inspect()
+
+        def PAYLOAD = mapToJSON(map)
+        def response = httpRequest acceptType: 'APPLICATION_JSON', contentType: 'APPLICATION_JSON', httpMode: 'PUT', requestBody: PAYLOAD, url: "http://bridge.instabug.com"
+        if(response.status != 200) {
+            error("~~ Deployment Error ~~ \nstatus: " + response.status + "\nmessage: " + response.content)
+            return 1
+        }
+        println "status: " + response.status + " message: " + response.content
+        println response.content
+        return 0;
+    }
+}
+
+def cleanSlaves(slaves) {
+    parallel (
+        knapsack(slaves) {
+            node('jenkins-slaves') {
+                cleanUpNode();
+            }
+        }
+    )
+}
+
+pipeline {
+    agent any
+
+    options {
+        timestamps()
+        skipDefaultCheckout()
+        ansiColor('xterm')
+    }
+
+    stages {
+        stage('Building Containers') {
+            steps {
+                node('jenkins-slaves-base') {
+                    deleteDir()
+                    checkout scm
+                    info()
+                    sh "printenv"
+                    downloadBundle()
+                    buildImages();
+                }
+            }
+        }
+
+        stage('Testing') {
+            steps {
+                // execute rubocup then run tests
+                test(slaves)
+            }
+        }
+
+        stage('Cleanup Slaves') {
+            steps {
+                cleanSlaves(slaves)
+            }
+        }
+
+        stage('Pushing Images') {
+            steps {
+                script {
+                    if(env.BRANCH_NAME == 'dev' || env.BRANCH_NAME == 'master') {
+                        node('jenkins-slaves-base') {
+                            COMMIT = sh (script: "git rev-parse --short HEAD", returnStdout: true).replaceAll('\n', '')
+                            VERSION = matcher(sh (script: "cat VERSION.json", returnStdout: true), '"version":\\s*"(.+)"')
+                            login()
+                            if(env.BRANCH_NAME == 'dev') {
+                                sh "docker build -f dockerfile-rails -t instabug/backend-dev:latest -t instabug/backend-dev:${VERSION} -t instabug/backend-dev:${COMMIT} -t instabug/backend-dev:${env.BUILD_NUMBER} ."
+                                sh "docker push instabug/backend-dev"
+
+                                sh "docker build -f Dockerfile -t instabug/background-dev:latest -t instabug/background-dev:${COMMIT} -t instabug/background-dev:${VERSION} -t instabug/background-dev:${env.BUILD_NUMBER} ."
+                                sh "docker push instabug/background-dev"
+                            }
+                            if(env.BRANCH_NAME == 'master') {
+                                sh "docker build -f dockerfile-rails -t instabug/backend-master:latest -t instabug/backend-master:${COMMIT} -t instabug/backend-master:${VERSION} -t instabug/backend-master:${env.BUILD_NUMBER} ."
+                                sh "docker push instabug/backend-master"
+
+                                sh "docker build -f Dockerfile -t instabug/background-master:latest -t instabug/background-master:${COMMIT} -t instabug/background-master:${VERSION} -t instabug/background-master:${env.BUILD_NUMBER} ."
+                                sh "docker push instabug/background-master"
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Deploying') {
+            steps {
+                script {
+                    if(env.BRANCH_NAME == 'dev' || env.BRANCH_NAME == 'master') {
+                        node('jenkins-slaves-base') {
+                            if(env.BRANCH_NAME == 'dev') {
+                                // deploying rails app
+                                status = deploy('', 'rails', 'app');
+                                // deploying background
+                                if(status != 0) error("\n\n~~ Rails app failed to deploy, aborting deployment process ~~ \n\n")
+                                deploy('bp', 'background', '')
+                            }
+                            if(env.BRANCH_NAME == 'master') {
+                                // deploying rails app
+                                status = deploy('', 'rails', 'app')
+                                // deploying rails admin app
+                                deploy('', 'admin', 'app')
+                                if(status != 0) error("\n\n~~ Rails app failed to deploy, aborting deployment process ~~ \n\n")
+                                // deploying workers
+                                def backgroundProcesses = ["critical", "high_rps", "high_rps2", "uploaders", "crash_creator", "critical_slow", "non_critical", "processing_crashes", "elasticsearch", "pusher_events", "elasticsearch_sessions"]
+                                for(String process : backgroundProcesses) {
+                                    deploy('bp', process, '')
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            post {
+                failure {
+                    script {
+                        if (env.BRANCH_NAME == 'master') {
+                            message = "@channel release ${VERSION} FAILED to deploy! :scream:"
+                            slackSend channel: 'backend', teamDomain: 'instabugteam', color: '#CC0000', message: message, failOnError: false
+                        }
+                    }
+                }
+                success {
+                    script {
+                        script {
+                            if (env.BRANCH_NAME == 'master') {
+                                message = "@channel release ${VERSION} is deployed! :rocket: :smiley:"
+                                slackSend channel: 'backend', teamDomain: 'instabugteam', color: '#00CC00', message: message, failOnError: false
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Cleanup') {
+            steps {
+                node('jenkins-slaves-base') {
+                    cleanUpNode()
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            script {
+                sendMessage '#CC0000', 'Build failure :scream:'
+            }
+        }
+        success {
+            script {
+                sendMessage '#00CC00', 'Build successful :smiley:'
+            }
+        }
+    }
+}

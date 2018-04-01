@@ -1,0 +1,92 @@
+def app, utils
+def imageName = 'instabug/backend-core'
+def concurrency = 6
+def deployableBranches = ["master", "dev", "staging"]
+def channels = ["backend"]
+def serviceName = 'core'
+
+node('main-agent') {
+  ansiColor('xterm') {
+    stage('Clone repository') {
+      deleteDir() // Delete workspace directory for cleanup
+      checkout([
+        $class: 'GitSCM',
+        branches: [[name: BRANCH_NAME]],
+        extensions: [[$class: 'CloneOption', noTags: false]],
+        userRemoteConfigs: [[credentialsId: 'Github', url: 'https://github.com/Instabug/backend.git']]])
+      utils = load("./infra-config/ci/utils.groovy")
+      if(BRANCH_NAME in deployableBranches) { // Bump version if the branch can be deployed
+        RUN_PIPELINE = utils.bumpVersion() // Run pipeline iff it's a version commit
+      } else {
+        RUN_PIPELINE = true // if branch isn't deployable, run pipeline as normal
+      }
+      if (RUN_PIPELINE) {
+        utils.setup() // Stop previous builds
+      }
+    }
+
+    stage('Build image') {
+      if(RUN_PIPELINE) {
+        COMMIT = utils.getCommit()
+        utils.dockerRegistry { // build test image with our docker registry credentials
+          app = docker.build("$imageName:jenkins-$COMMIT", "--no-cache .") // docker is a jenkins plugin wrapper for docker cli
+        }
+        utils.pushImage(app, ["jenkins-$COMMIT"], null) // Push image for test slaves to pull
+      }
+    }
+
+    stage('Test image') {
+      // Skip unit tests in case the branch is deployable
+      if(BRANCH_NAME in deployableBranches || BRANCH_NAME =~ release_regex) {
+        println "Skipping unit tests" // Because tests already ran in the branch that was merged
+      }
+      else {
+        parallel ( // Takes array of closures and runs each in a node
+          utils.parallelize(app, concurrency, utils.getCommit(), "./infra-config/ci/prep-test-env.sh '$app.id' '$serviceName'", serviceName) {
+            sh 'bundle exec rubocop'
+            sh 'bundle exec rake db:drop db:create db:schema:load db:migrate'
+            sh 'KNAPSACK_GENERATE_REPORT=true bundle exec rake "knapsack:rspec[-f d -c]"'
+            sh 'cp knapsack_rspec_report.json /var/app/knapsack/knapsack_rspec_report.json' // Copy knapsack report to mounted folder for s3 upload
+          }
+        )
+      }
+    }
+
+    stage('Push image') {
+      if (RUN_PIPELINE) {
+        tags = ["$BRANCH_NAME-${utils.getVersion()}", "$BRANCH_NAME-$BUILD_NUMBER"]
+        utils.pushImage(app, tags, deployableBranches)
+      }
+    }
+
+    stage('Deploy') {
+      if (RUN_PIPELINE) {
+        utils.deployKubernetes('core', imageName, deployableBranches) // core is common in all branches
+        if(BRANCH_NAME in ["master", "staging"] || BRANCH_NAME =~ release_regex) { // deploy workers for master, staging
+          def backgroundProcesses = ["critical",
+                                     "uploaders",
+                                     "crash-creator",
+                                     "pusher-events",
+                                     "users-attributes-syncer",
+                                     "critical-slow",
+                                     "non-critical",
+                                     "processing-crashes",
+                                     "elasticsearch",
+                                     "applying-rules",
+                                     "crash-severity"]
+
+          for(process in backgroundProcesses) {
+              utils.deployKubernetes(process, imageName, deployableBranches)
+          }
+        }
+        else if(BRANCH_NAME == "dev") { // deploy single worker for dev
+          utils.deployKubernetes('core-worker', imageName, deployableBranches)
+        }
+        if(BRANCH_NAME =~ release_regex) {
+          message = "@channel *<${utils.releaseURL()}|${utils.releaseTag()}>* of *${serviceName}* is deployed:\n${utils.releaseChangelog()}"
+          utils.notifySlack(channels, message)
+        }
+      }
+    }
+  }
+}

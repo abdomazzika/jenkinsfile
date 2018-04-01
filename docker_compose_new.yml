@@ -1,0 +1,128 @@
+version: '2'
+
+services:
+  database:
+    image: 'mysql:5.6'
+    ports:
+      - '3306:3306'
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+
+  redis:
+    image: redis
+    ports:
+      - '6379:6379'
+
+  elasticsearch:
+    build:
+      context: .
+      dockerfile: Dockerfile-es
+    ports:
+      - '9200:9200'
+
+  elasticsearch-sessions:
+    build:
+      context: .
+      dockerfile: Dockerfile-es
+    ports:
+      - '9211:9200'
+
+  elasticsearch-oom-sessions:
+    build:
+      context: .
+      dockerfile: Dockerfile-es
+    ports:
+      - '9222:9200'
+
+  web: &base
+    build:
+      context: .
+    environment:
+      RACK_ENV: development
+      RAILS_ENV: development
+      ELASTICSEARCH_URL: http://elasticsearch:9200
+      MIGRATION: 1
+    links:
+      - database
+      - elasticsearch
+      - redis
+    ports:
+      - '3000:3000'
+    volumes:
+      - .:/var/app/
+    volumes_from:
+      - bundle
+    stdin_open: true
+    tty: true
+
+  test:
+    <<: *base
+    ports: []
+    environment:
+      RACK_ENV: test
+      RAILS_ENV: test
+      MIGRATION: 1
+
+    stdin_open: true
+    tty: true
+
+  sidekiq:
+    <<: *base
+    ports: []
+    command: ./infra-config/sidekiq_entry_point.sh
+    environment:
+      MIGRATION: 0
+      Q: '-q users_cached_fields
+          -q user_and_session_creation
+          -q oom_sessions_creator
+          -q oom-sessions-elasticsearch
+          -q elasticsearch
+          -q sessions-elasticsearch
+          -q oom-sessions-elasticsearch
+          -q bulk_actions
+          -q notifications
+          -q pusher_events
+          -q world_map_events
+          -q sdk_notifications
+          -q issue_location
+          -q messages_read_at_updater
+          -q device_registration
+          -q segment
+          -q issue_completion
+          -q mailers
+          -q stripe
+          -q dsyms_upload_handler
+          -q mapping_upload_handler
+          -q default
+          -q applying_rules
+          -q bug_creator
+          -q chat_creator
+          -q message_creator
+          -q crash_creator
+          -q state_attachment_uploader
+          -q bug_state_attachment_uploader
+          -q crash_state_attachment_uploader
+          -q state_logs_uploader
+          -q processing_crashes
+          -q processed_exception_fetcher
+          -q crashes_merging
+          -q csv_exporter
+          -q instabug_crash_creator
+          -q instabug_bug_creator
+          -q message_attachment_uploader
+          -q zipped_attachment_uploader
+          -q countries
+          -q subscription_state_creator
+          -q wire_transfer_invoices
+          -q crash_severity_updater
+          -q crash_symbolication_notifier'
+    stdin_open: true
+    tty: true
+
+  bundle:
+  # 'image' will vary depending on your docker-compose
+  # project name. You may need to run `docker-compose build web`
+  # before this works.
+    image: ruby:2.1.9
+    volumes:
+      - /bundle
